@@ -1,0 +1,240 @@
+import os
+import json
+import csv
+import shutil
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
+
+# =========================
+# SETTINGS
+# =========================
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+EPOCHS_INITIAL = 8
+EPOCHS_FINE = 8
+FINE_TUNE_LAYERS = 50
+SEED = 42
+
+TRAIN_DIR = Path("training_dataset")
+VAL_DIR = Path("validation_dataset")
+TEST_DIR = Path("test_set")
+
+OUTPUT_DIR = Path("model_outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# ⚡ Start with one strong model (expand later)
+MODELS_TO_TRY = ["efficientnet_b0"]
+
+tf.keras.utils.set_random_seed(SEED)
+
+# =========================
+# DATA LOADING
+# =========================
+train_data = tf.keras.utils.image_dataset_from_directory(
+    TRAIN_DIR,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    seed=SEED
+)
+
+val_data = tf.keras.utils.image_dataset_from_directory(
+    VAL_DIR,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+test_data = tf.keras.utils.image_dataset_from_directory(
+    TEST_DIR,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+class_names = train_data.class_names
+num_classes = len(class_names)
+
+print("Classes:", class_names)
+
+AUTOTUNE = tf.data.AUTOTUNE
+train_data = train_data.prefetch(AUTOTUNE)
+val_data = val_data.prefetch(AUTOTUNE)
+test_data = test_data.prefetch(AUTOTUNE)
+
+# =========================
+# CLASS WEIGHTS
+# =========================
+def get_labels(dataset):
+    y = []
+    for _, labels in dataset:
+        y.extend(labels.numpy())
+    return np.array(y)
+
+y_train = get_labels(train_data)
+
+class_weights = compute_class_weight(
+    class_weight="balanced",
+    classes=np.arange(num_classes),
+    y=y_train
+)
+
+class_weights = dict(enumerate(class_weights))
+print("Class weights:", class_weights)
+
+# =========================
+# MODEL
+# =========================
+def build_model():
+    base_model = tf.keras.applications.EfficientNetB0(
+        weights="imagenet",
+        include_top=False,
+        input_shape=IMG_SIZE + (3,)
+    )
+
+    base_model.trainable = False
+
+    inputs = tf.keras.Input(shape=IMG_SIZE + (3,))
+    
+    x = tf.keras.layers.RandomFlip("horizontal")(inputs)
+    x = tf.keras.layers.RandomRotation(0.1)(x)
+
+    x = tf.keras.applications.efficientnet.preprocess_input(x)
+
+    x = base_model(x, training=False)
+
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Dense(256, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+
+    model = tf.keras.Model(inputs, outputs)
+    return model, base_model
+
+# =========================
+# PLOT FUNCTION
+# =========================
+def plot_history(history, path):
+    plt.plot(history.history['accuracy'], label='train')
+    plt.plot(history.history['val_accuracy'], label='val')
+    plt.legend()
+    plt.savefig(path)
+    plt.close()
+
+# =========================
+# EVALUATION
+# =========================
+def evaluate(model, dataset, save_path):
+    y_true = []
+    y_pred = []
+
+    for images, labels in dataset:
+        preds = model.predict(images, verbose=0)
+        y_true.extend(labels.numpy())
+        y_pred.extend(np.argmax(preds, axis=1))
+
+    cm = confusion_matrix(y_true, y_pred)
+
+    print("\nConfusion Matrix:\n", cm)
+
+    report = classification_report(y_true, y_pred, target_names=class_names)
+    print("\nClassification Report:\n", report)
+
+    # Save
+    np.savetxt(save_path / "confusion_matrix.csv", cm, delimiter=",", fmt="%d")
+
+    with open(save_path / "classification_report.txt", "w") as f:
+        f.write(report)
+
+# =========================
+# TRAINING
+# =========================
+def train():
+    model_dir = OUTPUT_DIR / "efficientnet_b0"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    model, base_model = build_model()
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+
+    checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        model_dir / "best_initial.keras",
+        monitor="val_accuracy",
+        save_best_only=True
+    )
+
+    print("\n🚀 Initial training...")
+    history1 = model.fit(
+        train_data,
+        validation_data=val_data,
+        epochs=EPOCHS_INITIAL,
+        class_weight=class_weights,
+        callbacks=[checkpoint]
+    )
+
+    plot_history(history1, model_dir / "initial_training.png")
+
+    # =========================
+    # FINE TUNING
+    # =========================
+    print("\n🔥 Fine-tuning...")
+
+    base_model.trainable = True
+
+    for layer in base_model.layers[:-FINE_TUNE_LAYERS]:
+        layer.trainable = False
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-5),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+
+    checkpoint_fine = tf.keras.callbacks.ModelCheckpoint(
+        model_dir / "best_fine_tuned.keras",
+        monitor="val_accuracy",
+        save_best_only=True
+    )
+
+    history2 = model.fit(
+        train_data,
+        validation_data=val_data,
+        epochs=EPOCHS_FINE,
+        class_weight=class_weights,
+        callbacks=[checkpoint_fine]
+    )
+
+    plot_history(history2, model_dir / "fine_tuning.png")
+
+    # =========================
+    # LOAD BEST MODEL
+    # =========================
+    print("\n✅ Loading best model...")
+    best_model = tf.keras.models.load_model(model_dir / "best_fine_tuned.keras")
+
+    # =========================
+    # FINAL EVALUATION
+    # =========================
+    print("\n📊 Evaluating on test set...")
+    evaluate(best_model, test_data, model_dir)
+
+    best_model.save(model_dir / "final_model.keras")
+
+    print("\n🎉 Training complete!")
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    train()
