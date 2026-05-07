@@ -1,0 +1,626 @@
+import csv
+import json
+import ssl
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
+
+try:
+    import certifi
+
+    def _certifi_https_context(*args, **kwargs):
+        kwargs.setdefault("cafile", certifi.where())
+        return ssl.create_default_context(*args, **kwargs)
+
+    ssl._create_default_https_context = _certifi_https_context
+except Exception:
+    pass
+
+
+# =========================
+# SETTINGS
+# =========================
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+EPOCHS_INITIAL = 8
+EPOCHS_FINE = 8
+FINE_TUNE_LAYERS = 50
+SEED = 42
+
+TRAIN_DIR = Path("training_dataset")
+VAL_DIR = Path("validation_dataset")
+TEST_DIR = Path("test_set")
+
+OUTPUT_DIR = Path("model_outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# DenseNet150 is not a standard Keras model.
+# Add any of these when you want comparison:
+# "mobilenet_v2", "densenet121", "densenet169", "densenet201", "resnet50"
+MODELS_TO_TRY = ["efficientnet_b0"]
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
+tf.keras.utils.set_random_seed(SEED)
+
+
+# =========================
+# DATA VALIDATION
+# =========================
+def validate_dataset_dir(path):
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset folder does not exist: {path}")
+
+    class_dirs = sorted([p for p in path.iterdir() if p.is_dir()])
+    if len(class_dirs) < 2:
+        raise ValueError(f"{path} must contain at least two class folders.")
+
+    class_names = [p.name for p in class_dirs]
+    empty_classes = []
+
+    for class_dir in class_dirs:
+        image_count = sum(
+            1
+            for file_path in class_dir.rglob("*")
+            if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if image_count == 0:
+            empty_classes.append(class_dir.name)
+
+    if empty_classes:
+        raise ValueError(f"These class folders contain no supported images: {empty_classes}")
+
+    return class_names
+
+
+def validate_matching_classes(train_dir, val_dir, test_dir):
+    train_classes = validate_dataset_dir(train_dir)
+    val_classes = validate_dataset_dir(val_dir)
+
+    if train_classes != val_classes:
+        raise ValueError(
+            "Training and validation class folders must match exactly.\n"
+            f"Training classes: {train_classes}\n"
+            f"Validation classes: {val_classes}"
+        )
+
+    if test_dir.exists():
+        test_classes = validate_dataset_dir(test_dir)
+        if train_classes != test_classes:
+            raise ValueError(
+                "Training and test class folders must match exactly.\n"
+                f"Training classes: {train_classes}\n"
+                f"Test classes: {test_classes}"
+            )
+    else:
+        print(f"Warning: {test_dir} not found. Final evaluation will use validation data.")
+
+    return train_classes
+
+
+CLASS_NAMES = validate_matching_classes(TRAIN_DIR, VAL_DIR, TEST_DIR)
+NUM_CLASSES = len(CLASS_NAMES)
+
+print("Classes:", CLASS_NAMES)
+
+
+# =========================
+# DATA LOADING
+# =========================
+def ignore_bad_images(dataset):
+    try:
+        return dataset.ignore_errors()
+    except AttributeError:
+        return dataset.apply(tf.data.experimental.ignore_errors())
+
+
+def load_dataset(path, shuffle):
+    dataset = tf.keras.utils.image_dataset_from_directory(
+        path,
+        labels="inferred",
+        label_mode="int",
+        class_names=CLASS_NAMES,
+        color_mode="rgb",
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        shuffle=shuffle,
+        seed=SEED,
+    )
+    dataset = ignore_bad_images(dataset)
+    return dataset.prefetch(tf.data.AUTOTUNE)
+
+
+train_data = load_dataset(TRAIN_DIR, shuffle=True)
+val_data = load_dataset(VAL_DIR, shuffle=False)
+test_data = load_dataset(TEST_DIR, shuffle=False) if TEST_DIR.exists() else val_data
+
+
+# =========================
+# CLASS WEIGHTS
+# =========================
+def collect_labels(dataset):
+    labels = []
+    for _, batch_labels in dataset:
+        labels.extend(batch_labels.numpy().tolist())
+    return np.array(labels, dtype=np.int64)
+
+
+y_train = collect_labels(train_data)
+
+class_weight_values = compute_class_weight(
+    class_weight="balanced",
+    classes=np.arange(NUM_CLASSES),
+    y=y_train,
+)
+
+class_weights = {index: float(weight) for index, weight in enumerate(class_weight_values)}
+print("Class weights:", class_weights)
+
+
+# =========================
+# PREPROCESSING
+# =========================
+@tf.keras.utils.register_keras_serializable()
+class CaffePreprocess(tf.keras.layers.Layer):
+    def call(self, inputs):
+        x = tf.cast(inputs, tf.float32)
+        x = tf.reverse(x, axis=[-1])
+        mean = tf.constant([103.939, 116.779, 123.68], dtype=x.dtype)
+        return x - mean
+
+
+def get_preprocess_layer(model_name):
+    if model_name == "mobilenet_v2":
+        return tf.keras.layers.Rescaling(
+            scale=1.0 / 127.5,
+            offset=-1.0,
+            name="mobilenet_v2_preprocess",
+        )
+
+    if model_name.startswith("densenet") or model_name == "resnet50":
+        return CaffePreprocess(name=f"{model_name}_preprocess")
+
+    # EfficientNetB0 includes preprocessing internally and expects 0-255 pixels.
+    return tf.keras.layers.Activation("linear", name="identity_preprocess")
+
+
+# =========================
+# MODEL FACTORY
+# =========================
+def get_base_model(model_name):
+    builders = {
+        "efficientnet_b0": tf.keras.applications.EfficientNetB0,
+        "mobilenet_v2": tf.keras.applications.MobileNetV2,
+        "densenet121": tf.keras.applications.DenseNet121,
+        "densenet169": tf.keras.applications.DenseNet169,
+        "densenet201": tf.keras.applications.DenseNet201,
+        "resnet50": tf.keras.applications.ResNet50,
+    }
+
+    if model_name not in builders:
+        supported = ", ".join(builders)
+        raise ValueError(f"Unsupported model '{model_name}'. Choose one of: {supported}")
+
+    try:
+        return builders[model_name](
+            weights="imagenet",
+            include_top=False,
+            input_shape=IMG_SIZE + (3,),
+        )
+    except Exception as error:
+        print(f"Could not load ImageNet weights for {model_name}. Training from scratch.")
+        print("Reason:", error)
+        return builders[model_name](
+            weights=None,
+            include_top=False,
+            input_shape=IMG_SIZE + (3,),
+        )
+
+
+def build_model(model_name):
+    base_model = get_base_model(model_name)
+    base_model.trainable = False
+
+    data_augmentation = tf.keras.Sequential(
+        [
+            tf.keras.layers.RandomFlip("horizontal"),
+            tf.keras.layers.RandomRotation(0.10),
+            tf.keras.layers.RandomZoom(0.10),
+            tf.keras.layers.RandomContrast(0.10),
+        ],
+        name="data_augmentation",
+    )
+
+    inputs = tf.keras.Input(shape=IMG_SIZE + (3,))
+    x = data_augmentation(inputs)
+    x = get_preprocess_layer(model_name)(x)
+    x = base_model(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Dense(256, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.35)(x)
+    outputs = tf.keras.layers.Dense(NUM_CLASSES, activation="softmax")(x)
+
+    model = tf.keras.Model(inputs, outputs, name=model_name)
+    return model, base_model
+
+
+# =========================
+# PLOTS
+# =========================
+def plot_history(history, save_path, title):
+    accuracy = history.history.get("accuracy", [])
+    val_accuracy = history.history.get("val_accuracy", [])
+    loss = history.history.get("loss", [])
+    val_loss = history.history.get("val_loss", [])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(accuracy, label="train")
+    axes[0].plot(val_accuracy, label="val")
+    axes[0].set_title(f"{title} Accuracy")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Accuracy")
+    axes[0].legend()
+
+    axes[1].plot(loss, label="train")
+    axes[1].plot(val_loss, label="val")
+    axes[1].set_title(f"{title} Loss")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Loss")
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=180)
+    plt.close(fig)
+
+
+def save_confusion_matrix_plot(matrix, save_path):
+    size = max(7, min(14, len(CLASS_NAMES) * 0.9))
+    fig, ax = plt.subplots(figsize=(size, size))
+    image = ax.imshow(matrix, interpolation="nearest", cmap="Blues")
+    fig.colorbar(image, ax=ax)
+
+    ax.set(
+        xticks=np.arange(NUM_CLASSES),
+        yticks=np.arange(NUM_CLASSES),
+        xticklabels=CLASS_NAMES,
+        yticklabels=CLASS_NAMES,
+        xlabel="Predicted label",
+        ylabel="True label",
+        title="Confusion Matrix",
+    )
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    threshold = matrix.max() / 2 if matrix.size and matrix.max() > 0 else 0
+    for row in range(matrix.shape[0]):
+        for col in range(matrix.shape[1]):
+            color = "white" if matrix[row, col] > threshold else "black"
+            ax.text(col, row, str(matrix[row, col]), ha="center", va="center", color=color)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+# =========================
+# EVALUATION
+# =========================
+def evaluate(model, dataset, save_path):
+    y_true = []
+    y_pred = []
+    confidences = []
+
+    for images, labels in dataset:
+        probabilities = model.predict(images, verbose=0)
+        predictions = np.argmax(probabilities, axis=1)
+        confidence = np.max(probabilities, axis=1)
+
+        y_true.extend(labels.numpy().tolist())
+        y_pred.extend(predictions.tolist())
+        confidences.extend(confidence.tolist())
+
+    labels = list(range(NUM_CLASSES))
+    matrix = confusion_matrix(y_true, y_pred, labels=labels)
+
+    report_text = classification_report(
+        y_true,
+        y_pred,
+        labels=labels,
+        target_names=CLASS_NAMES,
+        zero_division=0,
+    )
+
+    report_dict = classification_report(
+        y_true,
+        y_pred,
+        labels=labels,
+        target_names=CLASS_NAMES,
+        zero_division=0,
+        output_dict=True,
+    )
+
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision_macro": float(report_dict["macro avg"]["precision"]),
+        "recall_macro": float(report_dict["macro avg"]["recall"]),
+        "f1_macro": float(report_dict["macro avg"]["f1-score"]),
+        "precision_weighted": float(report_dict["weighted avg"]["precision"]),
+        "recall_weighted": float(report_dict["weighted avg"]["recall"]),
+        "f1_weighted": float(report_dict["weighted avg"]["f1-score"]),
+    }
+
+    print("\nConfusion Matrix:\n", matrix)
+    print("\nClassification Report:\n", report_text)
+
+    with open(save_path / "metrics.json", "w") as file:
+        json.dump(metrics, file, indent=2)
+
+    with open(save_path / "classification_report.txt", "w") as file:
+        file.write(report_text)
+
+    with open(save_path / "classification_report.json", "w") as file:
+        json.dump(report_dict, file, indent=2)
+
+    with open(save_path / "classification_report.csv", "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["class", "precision", "recall", "f1_score", "support"])
+
+        for key, value in report_dict.items():
+            if isinstance(value, dict):
+                writer.writerow(
+                    [
+                        key,
+                        value.get("precision", ""),
+                        value.get("recall", ""),
+                        value.get("f1-score", ""),
+                        value.get("support", ""),
+                    ]
+                )
+
+    with open(save_path / "confusion_matrix.csv", "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["true/predicted", *CLASS_NAMES])
+        for class_name, row in zip(CLASS_NAMES, matrix.tolist()):
+            writer.writerow([class_name, *row])
+
+    with open(save_path / "predictions.csv", "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["row", "true_label", "predicted_label", "confidence"])
+
+        for index, (true_label, predicted_label, confidence) in enumerate(
+            zip(y_true, y_pred, confidences),
+            start=1,
+        ):
+            writer.writerow(
+                [
+                    index,
+                    CLASS_NAMES[int(true_label)],
+                    CLASS_NAMES[int(predicted_label)],
+                    float(confidence),
+                ]
+            )
+
+    save_confusion_matrix_plot(matrix, save_path / "confusion_matrix.png")
+    return metrics
+
+
+# =========================
+# TRAINING HELPERS
+# =========================
+def make_callbacks(model_dir, stage):
+    return [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(model_dir / f"best_{stage}.keras"),
+            monitor="val_accuracy",
+            save_best_only=True,
+            mode="max",
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=3,
+            restore_best_weights=True,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.3,
+            patience=2,
+            min_lr=1e-7,
+        ),
+        tf.keras.callbacks.CSVLogger(
+            filename=str(model_dir / f"{stage}_training_log.csv"),
+            append=False,
+        ),
+    ]
+
+
+def freeze_batch_norm_layers(model):
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.BatchNormalization):
+            layer.trainable = False
+
+
+def choose_best_checkpoint(model_dir):
+    candidates = [
+        model_dir / "best_initial.keras",
+        model_dir / "best_fine_tuned.keras",
+    ]
+
+    best_path = None
+    best_accuracy = -1.0
+
+    for path in candidates:
+        if not path.exists():
+            continue
+
+        candidate = tf.keras.models.load_model(path)
+        loss, accuracy = candidate.evaluate(val_data, verbose=0)
+
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_path = path
+
+    if best_path is None:
+        raise FileNotFoundError("No checkpoint was saved.")
+
+    print(f"Best validation checkpoint: {best_path.name} with accuracy {best_accuracy:.4f}")
+    return best_path
+
+
+def train_one_model(model_name):
+    print(f"\nTraining model: {model_name}")
+
+    model_dir = OUTPUT_DIR / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    model, base_model = build_model(model_name)
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+    print("\nInitial training...")
+    history_initial = model.fit(
+        train_data,
+        validation_data=val_data,
+        epochs=EPOCHS_INITIAL,
+        class_weight=class_weights,
+        callbacks=make_callbacks(model_dir, "initial"),
+    )
+
+    plot_history(history_initial, model_dir / "initial_training.png", "Initial Training")
+
+    print("\nFine-tuning...")
+
+    base_model.trainable = True
+
+    for layer in base_model.layers[:-FINE_TUNE_LAYERS]:
+        layer.trainable = False
+
+    freeze_batch_norm_layers(base_model)
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+    history_fine = model.fit(
+        train_data,
+        validation_data=val_data,
+        epochs=EPOCHS_FINE,
+        class_weight=class_weights,
+        callbacks=make_callbacks(model_dir, "fine_tuned"),
+    )
+
+    plot_history(history_fine, model_dir / "fine_tuning.png", "Fine Tuning")
+
+    print("\nLoading best checkpoint...")
+    best_checkpoint = choose_best_checkpoint(model_dir)
+    best_model = tf.keras.models.load_model(best_checkpoint)
+
+    print("\nEvaluating final model...")
+    metrics = evaluate(best_model, test_data, model_dir)
+
+    best_model.save(model_dir / "final_model.keras")
+
+    summary = {
+        "model_name": model_name,
+        "classes": CLASS_NAMES,
+        "best_checkpoint": best_checkpoint.name,
+        "metrics": metrics,
+    }
+
+    with open(model_dir / "summary.json", "w") as file:
+        json.dump(summary, file, indent=2)
+
+    print(f"\nResults for {model_name}")
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"Precision weighted: {metrics['precision_weighted']:.4f}")
+    print(f"Recall weighted: {metrics['recall_weighted']:.4f}")
+    print(f"F1 weighted: {metrics['f1_weighted']:.4f}")
+
+    return summary
+
+
+# =========================
+# RUN
+# =========================
+def main():
+    all_results = []
+
+    for model_name in MODELS_TO_TRY:
+        try:
+            result = train_one_model(model_name)
+            all_results.append(result)
+        except tf.errors.ResourceExhaustedError:
+            print(f"Memory error while training {model_name}. Try reducing BATCH_SIZE.")
+        except Exception as error:
+            print(f"Failed training {model_name}. Reason: {error}")
+
+    if not all_results:
+        raise RuntimeError("No models trained successfully.")
+
+    best_result = max(
+        all_results,
+        key=lambda result: (
+            result["metrics"]["f1_weighted"],
+            result["metrics"]["accuracy"],
+        ),
+    )
+
+    with open(OUTPUT_DIR / "model_comparison.json", "w") as file:
+        json.dump(
+            {
+                "best_model": best_result["model_name"],
+                "best_metrics": best_result["metrics"],
+                "all_results": all_results,
+            },
+            file,
+            indent=2,
+        )
+
+    with open(OUTPUT_DIR / "model_comparison.csv", "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                "model",
+                "accuracy",
+                "precision_weighted",
+                "recall_weighted",
+                "f1_weighted",
+                "f1_macro",
+            ]
+        )
+
+        for result in all_results:
+            metrics = result["metrics"]
+            writer.writerow(
+                [
+                    result["model_name"],
+                    metrics["accuracy"],
+                    metrics["precision_weighted"],
+                    metrics["recall_weighted"],
+                    metrics["f1_weighted"],
+                    metrics["f1_macro"],
+                ]
+            )
+
+    print("\nTraining complete.")
+    print(f"Best model: {best_result['model_name']}")
+    print(f"Reports saved in: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
